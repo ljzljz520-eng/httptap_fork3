@@ -26,8 +26,8 @@ from .constants import (
 )
 from .http_client import HTTPClientError
 from .models import StepMetrics
+from .redaction import RedactionPolicy
 from .request_executor import HTTPClientRequestExecutor, RequestExecutor, RequestOptions, RequestOutcome
-from .utils import redact_url_credentials, sanitize_headers
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -99,6 +99,7 @@ class HTTPTapAnalyzer:
     __slots__ = (
         "_dns_resolver",
         "_noproxy",
+        "_policy",
         "_proxy",
         "_request",
         "_timing_collector",
@@ -126,6 +127,7 @@ class HTTPTapAnalyzer:
         dns_resolver: DNSResolver | None = None,
         tls_inspector: TLSInspector | None = None,
         timing_collector_factory: type[TimingCollector] | None = None,
+        redaction_policy: RedactionPolicy | None = None,
     ) -> None:
         """Initialize HTTP analyzer.
 
@@ -152,6 +154,10 @@ class HTTPTapAnalyzer:
                 If None, make_request will use its default (PerfCounterTimingCollector).
                 Note: This should be a class, not an instance, as a new collector
                 is created for each request.
+            redaction_policy: Session policy deciding which query keys and
+                header values are masked in every safe view. Defaults to a
+                policy with the built-in sensitive key sets. The same instance
+                should be shared with the output renderer and JSON exporter.
 
         """
         self.follow_redirects = follow_redirects
@@ -166,6 +172,9 @@ class HTTPTapAnalyzer:
         self._timing_collector = timing_collector_factory
         self._proxy = proxy
         self._noproxy = noproxy
+        self._policy = redaction_policy or RedactionPolicy()
+        if proxy is not None:
+            self._policy.learn_url(str(getattr(proxy, "url", proxy)))
 
     def analyze_url(
         self,
@@ -232,8 +241,10 @@ class HTTPTapAnalyzer:
                 break
 
             if step.is_redirect:
-                # Follow redirect
-                next_url = step.response.location
+                # Follow redirect. The raw Location is required for correct
+                # relative-reference resolution; the safe view must never be
+                # joined (its masked values would corrupt the next request).
+                next_url = step.response.raw_location
                 if next_url:
                     # Handle relative URLs
                     next_url = urljoin(current_url, next_url)
@@ -284,12 +295,27 @@ class HTTPTapAnalyzer:
             with error information, ensuring the analysis chain can continue.
 
         """
-        step = StepMetrics(url=url, step_number=step_number)
+        policy = self._policy
+        # Learn this hop's secrets before execution so failure messages can
+        # be scrubbed even when the transport never completes.
+        policy.learn_url(url)
+        policy.learn_headers(headers)
 
-        # Populate request metadata
+        # The step carries the safe URL view only; the raw URL is retained
+        # separately for transport and redirect resolution.
+        safe_url = policy.redact_url(url) or url
+        step = StepMetrics(url=safe_url, raw_url=url, step_number=step_number)
+
+        # Populate request metadata. The executor still receives the raw
+        # headers via RequestOptions; only the stored view is sanitized.
         step.request_method = method.value
-        step.request_headers = sanitize_headers(headers) if headers else {}
+        step.request_headers = policy.redact_headers(headers)
         step.request_body_bytes = len(content) if content else 0
+
+        # Show the configured proxy even when the transport fails; the
+        # outcome below overrides it with the effective proxy when known.
+        if self._proxy is not None:
+            step.proxied_via = policy.redact_url(str(getattr(self._proxy, "url", self._proxy)))
 
         try:
             # Create timing collector instance if factory provided
@@ -316,19 +342,38 @@ class HTTPTapAnalyzer:
             # Populate step metrics
             step.timing = outcome.timing
             step.network = outcome.network
-            step.response = outcome.response
-            step.proxied_via = outcome.network.proxy_url or (
-                redact_url_credentials(str(self._proxy)) if self._proxy else None
-            )
+
+            # The executor reports the raw Location (needed for urljoin) and
+            # default-sanitized headers. Re-apply the session policy so custom
+            # sensitive names are masked as well, then split raw/safe Location.
+            response = outcome.response
+            raw_location = response.location
+            if raw_location is not None:
+                # The raw Location feeds urljoin (above) only; the stored
+                # view and headers mapping carry the masked copy.
+                safe_location = policy.redact_url(raw_location) or raw_location
+                response.raw_location = raw_location
+                response.location = safe_location
+                for header_name in tuple(response.headers):
+                    if header_name.lower() == "location":
+                        response.headers[header_name] = safe_location
+            response.headers = policy.redact_headers(response.headers)
+            step.response = response
+
+            if outcome.network.proxy_url:
+                # Effective proxy may come from configuration or environment.
+                step.network.proxy_url = policy.redact_url(outcome.network.proxy_url)
+                step.proxied_via = step.network.proxy_url
 
         except HTTPClientError as e:
-            # Request failed, but we have partial data
-            step.error = str(e)
+            # Request failed, but we have partial data. Scrub the message
+            # (httpx may embed the target URL, timeout detail, or proxy).
+            step.error = policy.redact_text(str(e))
             step.note = f"Step {step_number}: Request failed"
 
         except Exception as exc:  # noqa: BLE001
             # Unexpected error
-            step.error = str(exc)
+            step.error = policy.redact_text(str(exc))
             step.note = f"Step {step_number}: Unexpected error"
 
         return step

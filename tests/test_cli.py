@@ -29,6 +29,7 @@ from httptap.cli import (
 )
 from httptap.constants import UNIX_SIGNAL_EXIT_OFFSET, HTTPMethod
 from httptap.models import NetworkInfo, ResponseInfo, StepMetrics, TimingMetrics
+from httptap.redaction import RedactionPolicy
 from httptap.slo import SLOResult, SLOViolation
 
 if TYPE_CHECKING:
@@ -989,3 +990,82 @@ def test_determine_exit_code_network_error_overrides_slo() -> None:
     violation = SLOViolation(key="total", threshold_ms=500.0, actual_ms=900.0)
     result = SLOResult(thresholds_ms={"total": 500.0}, violations=(violation,))
     assert determine_exit_code([step], slo_result=result) == EXIT_NETWORK_ERROR
+
+
+def test_parser_redact_flags_default_to_none() -> None:
+    args = create_parser().parse_args(["https://example.test"])
+
+    assert args.redact_query_keys is None
+    assert args.redact_headers is None
+
+
+def test_parser_redact_flags_are_repeatable() -> None:
+    args = create_parser().parse_args(
+        [
+            "--redact-query-key",
+            "tenant_key",
+            "--redact-query-key",
+            "X-Auth-Sig",
+            "--redact-header",
+            "x-tenant-secret",
+            "--redact-header",
+            "X-Session",
+            "https://example.test",
+        ]
+    )
+
+    assert args.redact_query_keys == ["tenant_key", "X-Auth-Sig"]
+    assert args.redact_headers == ["x-tenant-secret", "X-Session"]
+
+
+class _CapturingProgress:
+    """Drop-in for rich.progress.Progress recording add_task() field values."""
+
+    last_fields: dict[str, Any] | None = None
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def add_task(self, _description: str, **kwargs: object) -> int:
+        type(self).last_fields = kwargs
+        return 1
+
+    def update(self, task_id: int, **kwargs: object) -> None:
+        del task_id, kwargs
+
+
+def test_execute_analysis_progress_text_is_masked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httptap.cli as cli_module
+
+    _CapturingProgress.last_fields = None
+    monkeypatch.setattr(cli_module, "Progress", _CapturingProgress)
+
+    class _NoopAnalyzer:
+        def analyze_url(self, url: str, **kwargs: object) -> list[StepMetrics]:
+            del url, kwargs
+            return []
+
+    args = Namespace(metrics_only=False, url="https://example.test?token=progresssecret123&page=2")
+    steps = cli_module._execute_analysis(
+        _NoopAnalyzer(),
+        args,
+        HTTPMethod.GET,
+        None,
+        {},
+        redaction_policy=RedactionPolicy(),
+    )
+
+    assert steps == []
+    assert _CapturingProgress.last_fields is not None
+    progress_url = cast("str", _CapturingProgress.last_fields["url"])
+    assert "progresssecret123" not in progress_url
+    assert "token=****" in progress_url
+    assert "page=2" in progress_url

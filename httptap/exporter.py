@@ -14,6 +14,7 @@ from rich.markup import escape
 
 from .interfaces import Exporter
 from .models import StepMetrics
+from .redaction import RedactionPolicy
 from .slo import SLOResult
 
 
@@ -48,16 +49,25 @@ class JSONExporter(Exporter):
 
     """
 
-    __slots__ = ("console",)
+    __slots__ = ("_policy", "console")
 
-    def __init__(self, console: Console) -> None:
+    def __init__(
+        self,
+        console: Console,
+        *,
+        redaction_policy: RedactionPolicy | None = None,
+    ) -> None:
         """Initialize JSON exporter.
 
         Args:
             console: Rich console instance.
+            redaction_policy: Session policy used to redact the free-form
+                initial URL. Steps passed to :meth:`export` must already
+                contain display-safe views produced by the analyzer.
 
         """
         self.console = console
+        self._policy = redaction_policy or RedactionPolicy()
 
     def export(
         self,
@@ -105,11 +115,12 @@ class JSONExporter(Exporter):
             Dictionary ready for JSON serialization.
 
         """
+        safe_initial_url = self._policy.redact_url(initial_url) or initial_url
         return {
-            "initial_url": initial_url,
+            "initial_url": safe_initial_url,
             "total_steps": len(steps),
             "steps": [step.to_dict() for step in steps],
-            "summary": self._build_summary(steps, initial_url, slo_result=slo_result),
+            "summary": self._build_summary(steps, safe_initial_url, slo_result=slo_result),
         }
 
     @staticmethod

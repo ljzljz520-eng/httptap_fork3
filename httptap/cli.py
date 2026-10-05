@@ -36,6 +36,7 @@ from .constants import (
     HTTPMethod,
 )
 from .models import StepMetrics
+from .redaction import RedactionPolicy
 from .render import OutputRenderer
 from .slo import (
     SLO_KEYS,
@@ -290,6 +291,31 @@ Exit codes:
             f"but exits with code {EXIT_SLO_VIOLATION}. Valid keys: {slo_keys_hint}."
         ),
     )
+    output_group.add_argument(
+        "--redact-query-key",
+        action="append",
+        dest="redact_query_keys",
+        metavar="KEY",
+        default=None,
+        help=(
+            "Mask the value of this query parameter in every output (terminal, "
+            "redirect table, errors, JSON). Case-insensitive; repeat to add "
+            "multiple keys. Built-in keys (token, api_key, signature, ...) are "
+            "always masked. The request itself is sent unchanged."
+        ),
+    )
+    output_group.add_argument(
+        "--redact-header",
+        action="append",
+        dest="redact_headers",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Mask the value of this request/response header in every output. "
+            "Case-insensitive; repeat to add multiple names. Built-in names "
+            "(Authorization, Cookie, Proxy-Authorization, ...) are always masked."
+        ),
+    )
 
     return parser
 
@@ -312,24 +338,27 @@ def setup_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
 
-def _execute_analysis(
+def _execute_analysis(  # noqa: PLR0913
     analyzer: HTTPTapAnalyzer,
     args: argparse.Namespace,
     method: HTTPMethod,
     content: bytes | None,
     headers: Mapping[str, str],
+    *,
+    redaction_policy: RedactionPolicy,
 ) -> list[StepMetrics]:
     """Execute HTTP analysis with optional progress reporting."""
     if args.metrics_only:
         return analyzer.analyze_url(args.url, method=method, content=content, headers=headers)
 
+    progress_url = escape(redaction_policy.redact_url(args.url) or args.url)
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]Analyzing {task.fields[url]}..."),
         console=Console(),
         transient=True,
     ) as progress:
-        task = progress.add_task("analyze", url=escape(args.url), total=None)
+        task = progress.add_task("analyze", url=progress_url, total=None)
         steps = analyzer.analyze_url(args.url, method=method, content=content, headers=headers)
         progress.update(task, completed=True)
         return steps
@@ -386,20 +415,27 @@ def _evaluate_slo(
     return evaluate_slo(step, thresholds)
 
 
-def validate_arguments(args: argparse.Namespace) -> bool:
+def validate_arguments(
+    args: argparse.Namespace,
+    *,
+    redaction_policy: RedactionPolicy | None = None,
+) -> bool:
     """Validate command-line arguments with Rich formatting.
 
     Args:
         args: Parsed arguments.
+        redaction_policy: Session policy used to keep the raw URL out of the
+            validation error panel when the URL itself is malformed.
 
     Returns:
         False if validation fails (error already printed), True if valid.
 
     """
     if not validate_url(args.url):
+        display_url = redaction_policy.redact_url(args.url) if redaction_policy else args.url
         error_text = Text()
         error_text.append("Invalid URL: ", style="bold red")
-        error_text.append(f"'{args.url}'", style="yellow")
+        error_text.append(f"'{display_url}'", style="yellow")
         error_text.append("\n\nURLs must start with ", style="red")
         error_text.append("http://", style="cyan")
         error_text.append(" or ", style="red")
@@ -537,7 +573,12 @@ def main() -> int:
         setup_signal_handlers()
         args = parser.parse_args()
 
-        if not validate_arguments(args):
+        policy = RedactionPolicy(
+            query_keys=args.redact_query_keys,
+            header_names=args.redact_headers,
+        )
+
+        if not validate_arguments(args, redaction_policy=policy):
             return EXIT_USAGE_ERROR
 
         if args.compact and args.metrics_only:
@@ -574,14 +615,16 @@ def main() -> int:
             ca_bundle_path=args.ca_bundle,
             proxy=None if noproxy else args.proxy,
             noproxy=noproxy,
+            redaction_policy=policy,
         )
 
         renderer = OutputRenderer(
             compact=args.compact,
             metrics_only=args.metrics_only,
+            redaction_policy=policy,
         )
 
-        steps = _execute_analysis(analyzer, args, method, content, headers_dict)
+        steps = _execute_analysis(analyzer, args, method, content, headers_dict, redaction_policy=policy)
         slo_result = _evaluate_slo(steps, args.slo_thresholds)
         renderer.render_analysis(steps, args.url, slo_result=slo_result)
         _export_results(renderer, steps, args, slo_result=slo_result)

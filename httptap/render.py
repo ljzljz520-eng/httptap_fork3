@@ -31,6 +31,7 @@ from .formatters import (
 )
 from .interfaces import Exporter, Visualizer
 from .models import StepMetrics
+from .redaction import RedactionPolicy
 from .slo import SLOResult, select_step_for_evaluation
 from .visualizer import WaterfallVisualizer
 
@@ -52,9 +53,9 @@ class OutputRenderer:
 
     """
 
-    __slots__ = ("compact", "console", "exporter", "metrics_only", "visualizer")
+    __slots__ = ("_policy", "compact", "console", "exporter", "metrics_only", "visualizer")
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         compact: bool = False,
@@ -62,6 +63,7 @@ class OutputRenderer:
         console: Console | None = None,
         visualizer: Visualizer | None = None,
         exporter: Exporter | None = None,
+        redaction_policy: RedactionPolicy | None = None,
     ) -> None:
         """Initialize output renderer.
 
@@ -71,13 +73,18 @@ class OutputRenderer:
             console: Custom console instance for output.
             visualizer: Custom visualizer implementation.
             exporter: Custom exporter implementation.
+            redaction_policy: Session policy used to redact the free-form
+                initial URL before display. Steps passed to rendering
+                methods must already contain display-safe views produced by
+                the analyzer.
 
         """
         self.compact = compact
         self.metrics_only = metrics_only
         self.console = console or Console()
+        self._policy = redaction_policy or RedactionPolicy()
         self.visualizer = visualizer or WaterfallVisualizer(self.console)
-        self.exporter = exporter or JSONExporter(self.console)
+        self.exporter = exporter or JSONExporter(self.console, redaction_policy=self._policy)
 
     def render_analysis(
         self,
@@ -111,12 +118,14 @@ class OutputRenderer:
             self._render_metrics_only(steps, slo_result=slo_result)
             return
 
+        safe_initial_url = self._policy.redact_url(initial_url) or initial_url
+
         if self.compact:
-            self._render_compact(steps, initial_url)
+            self._render_compact(steps, safe_initial_url)
             self._print_slo_panel(slo_result)
             return
 
-        self._print_header(initial_url)
+        self._print_header(safe_initial_url)
 
         for index, step in enumerate(steps):
             self._render_step(step)

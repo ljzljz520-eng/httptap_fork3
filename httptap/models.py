@@ -199,7 +199,13 @@ class ResponseInfo:
         content_type: Content-Type header value.
         server: Server header value.
         date: Date header parsed as datetime.
-        location: Location header for redirects.
+        location: Display-safe view of the Location header (secrets masked).
+            Safe for terminal output, :meth:`to_dict`, and reports. May be a
+            relative reference exactly as sent by the server.
+        raw_location: Original, unredacted Location header. Transport-only:
+            used to compute the next hop with
+            :func:`urllib.parse.urljoin`. Must never be displayed, logged,
+            or serialized. ``None`` when the response carried no Location.
         headers: Sanitized response headers (secrets masked).
 
     """
@@ -210,6 +216,7 @@ class ResponseInfo:
     server: str | None = None
     date: datetime | None = None
     location: str | None = None
+    raw_location: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -238,14 +245,20 @@ class StepMetrics:
     including timing, network, response information, and any errors.
 
     Attributes:
-        url: The URL that was requested.
+        url: Display-safe view of the requested URL (sensitive query values
+            and userinfo credentials masked). Safe for terminal output,
+            :meth:`to_dict`, and reports.
+        raw_url: Original, unredacted URL for this hop. Transport-only: used
+            to issue the request and to resolve relative redirects. Must
+            never be displayed, logged, or serialized.
         step_number: Step number in redirect chain (1-indexed).
         timing: Timing metrics.
         network: Network and security information.
         response: HTTP response information.
-        error: Error message if request failed.
+        error: Sanitized error message if request failed.
         note: Additional notes or context.
-        proxied_via: Proxy URL used for this request, if any.
+        proxied_via: Proxy URL used for this request, if any (credentials
+            masked).
         request_method: HTTP method used (GET, POST, PUT, etc.).
         request_headers: Request headers (sanitized).
         request_body_bytes: Size of request body in bytes.
@@ -253,6 +266,7 @@ class StepMetrics:
     """
 
     url: str = ""
+    raw_url: str = ""
     step_number: int = 1
     timing: TimingMetrics = field(default_factory=TimingMetrics)
     network: NetworkInfo = field(default_factory=NetworkInfo)

@@ -41,6 +41,11 @@ from .models import (
     StepMetrics,
     TimingMetrics,
 )
+from .redaction import (
+    DEFAULT_SENSITIVE_HEADERS,
+    DEFAULT_SENSITIVE_QUERY_KEYS,
+    RedactionPolicy,
+)
 from .render import OutputRenderer
 from .request_executor import HTTPClientRequestExecutor, RequestExecutor, RequestOptions, RequestOutcome
 from .slo import (
@@ -61,6 +66,8 @@ __author__ = _package_info.author
 __license__ = _package_info.license
 
 __all__ = [
+    "DEFAULT_SENSITIVE_HEADERS",
+    "DEFAULT_SENSITIVE_QUERY_KEYS",
     "SLO_KEYS",
     "DNSResolutionError",
     "DNSResolver",
@@ -71,6 +78,7 @@ __all__ = [
     "NetworkInfo",
     "OutputRenderer",
     "PerfCounterTimingCollector",
+    "RedactionPolicy",
     "RequestExecutor",
     "RequestOptions",
     "RequestOutcome",
